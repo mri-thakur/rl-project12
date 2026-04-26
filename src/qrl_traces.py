@@ -1,21 +1,31 @@
 """
-QRL with Eligibility Traces — Innovation over base QRL.
+QRL with Eligibility Traces — TD(λ) Innovation
+Dong et al. (2008) extension.
 
-Replaces TD(0) value update with TD(lambda) using eligibility traces.
-Everything else (amplitude representation, collapse selection,
-Grover-inspired rotation) stays identical to base QRL.
+The base QRLAgent uses TD(0) for its value update:
+    V(s) ← V(s) + α · δ
 
-TD(0):  V(s) <- V(s) + alpha * delta
-TD(λ):  V(s_i) <- V(s_i) + alpha * delta * e(s_i)  for ALL states
+This agent replaces that with TD(λ) eligibility traces:
+    e(s_t)  ← e(s_t) + 1                   (accumulate at current state)
+    V(s_i)  ← V(s_i) + α · δ · e(s_i)     (update all traced states)
+    e(s_i)  ← γ · λ · e(s_i)              (decay all traces)
 
-where:
-  delta = r + gamma*V(s') - V(s)       (TD error)
-  e(s) <- e(s) + 1                      (accumulating trace)
-  e(s_i) <- gamma * lambda * e(s_i)     (decay all traces)
+where δ = r + γV(s') − V(s) is the TD error.
 
-This propagates reward information backward through recently visited
-states in a single episode, instead of waiting for V to propagate
-one step at a time over many episodes.
+Key effect: credit is propagated backward through the episode's visited
+states in a single update step, rather than waiting for V to propagate
+one step per episode.  This gives faster convergence, especially early
+in training when the agent rarely reaches the goal.
+
+The Grover rotation (corrected, matching Eq. 40) is identical to QRLAgent.
+
+Parameters
+----------
+lam : float
+    Trace decay λ ∈ [0, 1].
+    λ = 0  →  TD(0), equivalent to the base QRLAgent value update.
+    λ = 1  →  full Monte-Carlo credit assignment.
+    λ ≈ 0.5 typically gives the best tradeoff.
 """
 
 import numpy as np
@@ -23,79 +33,121 @@ from collections import defaultdict
 
 
 class QRLTracesAgent:
-    def __init__(self, n_actions=4, alpha=0.06, gamma=0.99, k=0.1,
-                 lam=0.5):
+    def __init__(self, n_actions=4, alpha=0.06, gamma=0.99, k=0.01, lam=0.5):
         """
-        Same as QRLAgent plus:
-            lam: eligibility trace decay parameter (lambda)
+        Parameters
+        ----------
+        n_actions : int
+        alpha     : float  TD learning rate.
+        gamma     : float  Discount factor.
+        k         : float  Grover signal-to-iterations scale (same as QRLAgent).
+        lam       : float  Eligibility trace decay λ ∈ [0, 1].
         """
         self.n_actions = n_actions
-        self.alpha = alpha
-        self.gamma = gamma
-        self.k = k
-        self.lam = lam
-        self.V = defaultdict(float)
-        self.amplitudes = {}
+        self.alpha     = alpha
+        self.gamma     = gamma
+        self.k         = k
+        self.lam       = lam
+
         self.theta = np.arcsin(1.0 / np.sqrt(n_actions))
-        # Eligibility traces — reset each episode
-        self.traces = defaultdict(float)
+        self.L_max = max(1, int(np.pi / (4.0 * self.theta) - 0.5))
+
+        self.V             = defaultdict(float)
+        self.amplitudes    = {}
+        self.amplitudes_bk = {}
+        self.traces        = defaultdict(float)
+
+    # ── Episode boundary ──────────────────────────────────────────────────────
 
     def reset_traces(self):
-        """Call at the start of each episode."""
+        """Must be called at the start of every episode."""
         self.traces = defaultdict(float)
 
-    def _get_amplitudes(self, state):
+    # ── Amplitude helpers ─────────────────────────────────────────────────────
+
+    def _init_state(self, state):
+        amp = np.ones(self.n_actions) / np.sqrt(self.n_actions)
+        self.amplitudes[state]    = amp.copy()
+        self.amplitudes_bk[state] = amp.copy()
+
+    def _get_amp(self, state):
         if state not in self.amplitudes:
-            self.amplitudes[state] = np.ones(self.n_actions) / np.sqrt(self.n_actions)
+            self._init_state(state)
         return self.amplitudes[state]
 
+    # ── Action selection ──────────────────────────────────────────────────────
+
     def select_action(self, state):
-        amp = self._get_amplitudes(state)
+        """Collapse postulate: sample from |C_a|², restore backup register."""
+        amp   = self._get_amp(state)
         probs = amp ** 2
         probs /= probs.sum()
-        return np.random.choice(self.n_actions, p=probs)
+        action = np.random.choice(self.n_actions, p=probs)
+        self.amplitudes[state] = self.amplitudes_bk[state].copy()
+        return action
 
-    def _rotate_amplitude(self, state, action, delta_phi):
-        amp = self._get_amplitudes(state)
-        c_a = np.clip(amp[action], -1.0, 1.0)
-        phi = np.arcsin(c_a)
-        cos_phi = np.cos(phi)
-        new_phi = np.clip(phi + delta_phi, -np.pi/2 + 0.01, np.pi/2 - 0.01)
-        amp[action] = np.sin(new_phi)
-        if abs(cos_phi) > 1e-12:
-            scale = np.cos(new_phi) / cos_phi
+    # ── Grover rotation (identical to QRLAgent) ───────────────────────────────
+
+    def _grover_rotate(self, state, action, L):
+        """
+        L Grover iterations in the (|a⟩, |a⊥⟩) plane (Eq. 35-40).
+        Rotation direction increases φ (reinforces the action).
+        """
+        if L <= 0:
+            return
+
+        amp    = self._get_amp(state)
+        c_a    = amp[action]
+        c_perp = np.sqrt(max(0.0, 1.0 - c_a ** 2))
+
+        angle        = 2.0 * self.theta * L
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+
+        new_c_a    = cos_a * c_a    + sin_a * c_perp
+        new_c_perp = cos_a * c_perp - sin_a * c_a
+
+        amp[action] = new_c_a
+
+        if c_perp > 1e-12:
+            scale = new_c_perp / c_perp
             for j in range(self.n_actions):
                 if j != action:
                     amp[j] *= scale
         else:
-            each = np.cos(new_phi) / np.sqrt(self.n_actions - 1)
+            each = new_c_perp / np.sqrt(max(self.n_actions - 1, 1))
             for j in range(self.n_actions):
                 if j != action:
                     amp[j] = each
-        norm = np.sqrt(np.sum(amp ** 2))
+
+        norm = np.linalg.norm(amp)
         if norm > 1e-12:
-            amp[:] = amp / norm
-        self.amplitudes[state] = amp
+            amp /= norm
+
+        self.amplitudes[state]    = amp
+        self.amplitudes_bk[state] = amp.copy()
+
+    # ── Learning update ───────────────────────────────────────────────────────
 
     def update(self, state, action, reward, next_state, done):
-        """TD(lambda) value update + Grover amplitude rotation."""
-        v_next = 0.0 if done else self.V[next_state]
+        """
+        TD(λ) value update + Grover amplitude rotation.
+        Call reset_traces() at the start of each episode.
+        """
+        v_next   = 0.0 if done else self.V[next_state]
         td_error = reward + self.gamma * v_next - self.V[state]
 
-        # Accumulate trace for current state
+        # Accumulate trace for the current state
         self.traces[state] += 1.0
 
-        # Update V(s) for ALL traced states
+        # Update V for all traced states; decay traces
         for s in list(self.traces.keys()):
             self.V[s] += self.alpha * td_error * self.traces[s]
-            # Decay trace
             self.traces[s] *= self.gamma * self.lam
-            # Remove negligible traces
             if self.traces[s] < 1e-6:
                 del self.traces[s]
 
-        # Grover amplitude rotation — same as base QRL
+        # Grover rotation — only for positive reinforcement signal
         signal = reward + v_next
         if signal > 0:
-            delta_phi = self.k * signal * 2.0 * self.theta
-            self._rotate_amplitude(state, action, delta_phi)
+            L = min(int(self.k * signal), self.L_max)
+            self._grover_rotate(state, action, L)
