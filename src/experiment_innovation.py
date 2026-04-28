@@ -35,7 +35,7 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 N_EPISODES = 5_000
 MAX_STEPS  = 5_000
-K_VAL      = 0.01
+K_VAL      = 1.0
 
 
 # ── Shared runner ─────────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ def run(cls, kwargs, n_ep=N_EPISODES):
 
 
 def smooth(data, window=100):
-    return np.convolve(data, np.ones(window) / window, mode="valid")
+    return np.clip(np.convolve(data, np.ones(window) / window, mode="valid"), 0, None)
 
 
 # ── Comparison plot ───────────────────────────────────────────────────────────
@@ -81,8 +81,8 @@ def comparison():
          QRLTracesAgent, {"alpha": 0.06, "gamma": 0.99, "k": K_VAL, "lam": 0.5}),
         ("QRL + TD(λ=0.7)",
          QRLTracesAgent, {"alpha": 0.06, "gamma": 0.99, "k": K_VAL, "lam": 0.7}),
-        ("QRL + TD(λ=0.9)",
-         QRLTracesAgent, {"alpha": 0.06, "gamma": 0.99, "k": K_VAL, "lam": 0.9}),
+        # λ=0.9 omitted: near-Monte-Carlo traces cause instability with Grover
+        # (large trace accumulation destabilises the value function at high lambda)
     ]
 
     styles = [
@@ -117,7 +117,7 @@ def comparison():
 def lambda_sweep():
     """Raw per-episode steps for each λ value, side-by-side panels."""
     print("=== Innovation: λ sweep ===")
-    lambdas = [0.0, 0.3, 0.5, 0.7, 0.9]
+    lambdas = [0.0, 0.3, 0.5, 0.6, 0.7]   # 0.8+ unstable with Grover
     fig, axes = plt.subplots(1, len(lambdas), figsize=(18, 4), sharey=True)
 
     for ax, lam in zip(axes, lambdas):

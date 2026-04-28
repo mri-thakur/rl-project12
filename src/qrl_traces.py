@@ -33,7 +33,7 @@ from collections import defaultdict
 
 
 class QRLTracesAgent:
-    def __init__(self, n_actions=4, alpha=0.06, gamma=0.99, k=0.01, lam=0.5):
+    def __init__(self, n_actions=4, alpha=0.06, gamma=0.99, k=1.0, lam=0.5):
         """
         Parameters
         ----------
@@ -100,7 +100,10 @@ class QRLTracesAgent:
         c_a    = amp[action]
         c_perp = np.sqrt(max(0.0, 1.0 - c_a ** 2))
 
-        angle        = 2.0 * self.theta * L
+        phi_current = np.arcsin(np.clip(c_a, -1.0, 1.0))
+        phi_target  = min(phi_current + 2.0 * self.theta * L, np.pi / 2.0)
+
+        angle        = phi_target - phi_current
         cos_a, sin_a = np.cos(angle), np.sin(angle)
 
         new_c_a    = cos_a * c_a    + sin_a * c_perp
@@ -136,8 +139,8 @@ class QRLTracesAgent:
         v_next   = 0.0 if done else self.V[next_state]
         td_error = reward + self.gamma * v_next - self.V[state]
 
-        # Accumulate trace for the current state
-        self.traces[state] += 1.0
+        # Accumulate trace for the current state (replacing traces variant)
+        self.traces[state] = min(self.traces.get(state, 0.0) + 1.0, 5.0)
 
         # Update V for all traced states; decay traces
         for s in list(self.traces.keys()):
